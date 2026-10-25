@@ -1,0 +1,350 @@
+#!/bin/sh
+
+set -eu
+umask 077
+
+provider=openai
+model=gpt-5.6-luna
+batch_size=40
+
+usage() {
+printf %s "\
+Usage:
+  dorkeval [options] [input.jsonl]
+
+Options:
+  -findings FILE     Findings JSONL output (default: findings.jsonl)
+  -report FILE       Human-readable report (default: report.txt)
+  -prompt-dir DIR    Directory containing the four prompt files
+  -help              Show this help
+
+Input is JSONL, one object per line, with string fields:
+  query, title, url, snippet
+
+If input.jsonl is omitted or is "-", input is read from standard input.
+Requires: osai, jq
+" >&2
+
+exit "${1:-2}"
+}
+
+findings=findings.jsonl
+report=report.txt
+prompt_dir=
+
+while [ "$#" -gt 0 ]; do
+    case $1 in
+        -findings|-report|-prompt-dir)
+            option=$1
+            [ "$#" -ge 2 ] || usage
+            value=$2
+            case $option in
+                -findings) findings=$value ;;
+                -report) report=$value ;;
+                -prompt-dir) prompt_dir=$value ;;
+            esac
+            shift 2
+            ;;
+        -help|-h)
+            usage 0
+            ;;
+        --)
+            shift
+            break
+            ;;
+        -* )
+            printf 'dorkeval: unknown option: %s\n' "$1" >&2
+            usage
+            ;;
+        *)
+            break
+            ;;
+    esac
+done
+
+[ "$#" -le 1 ] || usage
+input=${1:--}
+
+if [ "$findings" = "$report" ]; then
+    printf 'dorkeval: findings and report paths must be different\n' >&2
+    exit 2
+fi
+
+command -v osai >/dev/null 2>&1 || {
+    printf 'dorkeval: osai not found in PATH\n' >&2
+    exit 2
+}
+command -v jq >/dev/null 2>&1 || {
+    printf 'dorkeval: jq not found in PATH\n' >&2
+    exit 2
+}
+
+case $0 in
+    */*) script_path=$0 ;;
+    *) script_path=$(command -v "$0") ;;
+esac
+script_dir=$(CDPATH= cd "$(dirname "$script_path")" && pwd)
+if [ -z "$prompt_dir" ]; then
+    prompt_dir=$script_dir/prompts
+fi
+
+eval_system=$prompt_dir/evaluate.system.txt
+eval_prompt=$prompt_dir/evaluate.prompt.txt
+report_system=$prompt_dir/report.system.txt
+report_prompt=$prompt_dir/report.prompt.txt
+
+for prompt_file in "$eval_system" "$eval_prompt" "$report_system" "$report_prompt"; do
+    if [ ! -r "$prompt_file" ]; then
+        printf 'dorkeval: cannot read prompt file: %s\n' "$prompt_file" >&2
+        exit 2
+    fi
+done
+
+tmpdir=$(mktemp -d "${TMPDIR:-/tmp}/dorkeval.XXXXXXXX") || {
+    printf 'dorkeval: cannot create temporary directory\n' >&2
+    exit 1
+}
+trap 'rm -rf "$tmpdir"' 0
+trap 'exit 1' HUP INT TERM
+
+input_copy=$tmpdir/input.jsonl
+normalized=$tmpdir/normalized.jsonl
+raw_findings=$tmpdir/raw-findings.jsonl
+validated_findings=$tmpdir/findings.jsonl
+raw_report=$tmpdir/report.txt
+: >"$raw_findings"
+
+if [ "$input" = "-" ]; then
+    if ! cat >"$input_copy"; then
+        printf 'dorkeval: failed to read standard input\n' >&2
+        exit 1
+    fi
+else
+    if ! cat "$input" >"$input_copy"; then
+        printf 'dorkeval: cannot read input file: %s\n' "$input" >&2
+        exit 1
+    fi
+fi
+
+if [ ! -s "$input_copy" ]; then
+    printf 'dorkeval: input is empty\n' >&2
+    exit 2
+fi
+
+line_number=0
+while IFS= read -r line || [ -n "$line" ]; do
+    line_number=$((line_number + 1))
+    if ! printf '%s\n' "$line" | jq -e '
+        type == "object" and
+        (.query | type == "string") and
+        (.title | type == "string") and
+        (.url | type == "string") and
+        (.snippet | type == "string")
+    ' >/dev/null 2>&1; then
+        printf 'dorkeval: invalid JSONL record or missing string field at line %s\n' \
+            "$line_number" >&2
+        exit 2
+    fi
+done <"$input_copy"
+
+# Deduplicate the entire input before chunking so IDs remain globally stable.
+if ! jq -s -c '
+    if length == 0 then
+        error("input contains no records")
+    else
+        map({query, title, url, snippet})
+        | group_by(.url)
+        | map({
+            url: .[0].url,
+            title: .[0].title,
+            snippet: .[0].snippet,
+            queries: (map(.query) | unique)
+        })
+        | to_entries
+        | map({
+            id: ("r" + ((.key + 1) | tostring)),
+            url: .value.url,
+            title: .value.title,
+            snippet: .value.snippet,
+            queries: .value.queries
+        })
+        | .[]
+    end
+' "$input_copy" >"$normalized"; then
+    printf 'dorkeval: failed to normalize input\n' >&2
+    exit 2
+fi
+
+result_count=$(jq -s 'length' "$normalized")
+if [ "$result_count" -eq 0 ]; then
+    printf 'dorkeval: input contains no results\n' >&2
+    exit 2
+fi
+batch_total=$(( (result_count + batch_size - 1) / batch_size ))
+printf 'dorkeval: evaluating %s unique search results in %s batches of up to %s with %s (%s)\n' \
+    "$result_count" "$batch_total" "$batch_size" "$provider" "$model" >&2
+
+process_batch() {
+    batch_file=$1
+    batch_number=$2
+    batch_results=$3
+    batch_output=$tmpdir/batch-output.jsonl
+    : >"$batch_output"
+
+    printf 'dorkeval: evaluating batch %s/%s (%s results)\n' \
+        "$batch_number" "$batch_total" "$batch_results" >&2
+
+    if ! osai \
+        -model "$model" \
+        -provider "$provider" \
+        -system "@$eval_system" \
+        -prompt "@$eval_prompt" \
+        -input "$batch_file" </dev/null >"$batch_output"; then
+        printf 'dorkeval: evaluation failed in batch %s; no final findings written\n' \
+            "$batch_number" >&2
+        exit 1
+    fi
+
+    line_number=0
+    while IFS= read -r line || [ -n "$line" ]; do
+        line_number=$((line_number + 1))
+        if ! printf '%s\n' "$line" | jq -e '
+            type == "object" and
+            (.category == "exposure" or .category == "staging_environment" or
+             .category == "api_surface" or .category == "cloud_storage" or
+             .category == "sensitive_document" or .category == "source_code_reference" or
+             .category == "legacy_resource" or .category == "other") and
+            (.priority == "high" or .priority == "medium" or .priority == "low") and
+            (.confidence == "high" or .confidence == "medium" or .confidence == "low") and
+            (.title | type == "string" and length > 0) and
+            (.result_ids | type == "array" and length > 0 and all(.[]; type == "string")) and
+            (.assessment | type == "string" and length > 0) and
+            (.reasoning | type == "string" and length > 0) and
+            (.next_step | type == "string" and length > 0)
+        ' >/dev/null 2>&1; then
+            printf 'dorkeval: invalid finding in batch %s, output line %s\n' \
+                "$batch_number" "$line_number" >&2
+            exit 1
+        fi
+    done <"$batch_output"
+
+    if ! jq -n -e \
+        --slurpfile model_findings "$batch_output" \
+        --slurpfile batch_results "$batch_file" '
+        ($batch_results | map(.id)) as $known_ids
+        | all($model_findings[];
+            all(.result_ids[]; . as $id | $known_ids | index($id) != null)
+        )
+    ' >/dev/null; then
+        printf 'dorkeval: model referenced an ID outside batch %s\n' "$batch_number" >&2
+        exit 1
+    fi
+
+    if [ -s "$batch_output" ]; then
+        cat "$batch_output" >>"$raw_findings"
+    fi
+}
+
+batch_number=1
+batch_results=0
+batch_file=$tmpdir/batch-1.jsonl
+: >"$batch_file"
+while IFS= read -r line || [ -n "$line" ]; do
+    printf '%s\n' "$line" >>"$batch_file"
+    batch_results=$((batch_results + 1))
+    if [ "$batch_results" -eq "$batch_size" ]; then
+        process_batch "$batch_file" "$batch_number" "$batch_results"
+        batch_number=$((batch_number + 1))
+        batch_results=0
+        batch_file=$tmpdir/batch-$batch_number.jsonl
+        : >"$batch_file"
+    fi
+done <"$normalized"
+
+if [ "$batch_results" -gt 0 ]; then
+    process_batch "$batch_file" "$batch_number" "$batch_results"
+fi
+
+# Attach original evidence to every finding and verify all IDs globally.
+if ! jq -n -c \
+    --slurpfile model_findings "$raw_findings" \
+    --slurpfile source_results "$normalized" '
+    ($source_results | map(.id)) as $known_ids
+    | $model_findings[] as $finding
+    | $finding + {
+        evidence: [
+            $source_results[] as $result
+            | select(($finding.result_ids | index($result.id)) != null)
+            | {
+                result_id: $result.id,
+                url: $result.url,
+                title: $result.title,
+                snippet: $result.snippet,
+                queries: $result.queries
+            }
+        ]
+    }
+' >"$validated_findings"; then
+    printf 'dorkeval: failed to enrich findings\n' >&2
+    exit 1
+fi
+
+if ! jq -n -e \
+    --slurpfile model_findings "$raw_findings" \
+    --slurpfile source_results "$normalized" '
+    ($source_results | map(.id)) as $known_ids
+    | all($model_findings[];
+        all(.result_ids[]; . as $id | $known_ids | index($id) != null)
+    )
+' >/dev/null; then
+    printf 'dorkeval: model referenced an unknown result ID\n' >&2
+    exit 1
+fi
+
+findings_tmp=${findings}.tmp.$$
+if ! cat "$validated_findings" >"$findings_tmp"; then
+    rm -f "$findings_tmp"
+    printf 'dorkeval: cannot write findings file: %s\n' "$findings" >&2
+    exit 1
+fi
+
+if ! mv "$findings_tmp" "$findings"; then
+    rm -f "$findings_tmp"
+    printf 'dorkeval: cannot install findings file: %s\n' "$findings" >&2
+    exit 1
+fi
+
+finding_count=$(jq -s 'length' "$findings")
+printf 'dorkeval: saved %s findings to %s\n' "$finding_count" "$findings" >&2
+printf 'dorkeval: generating report\n' >&2
+
+if ! osai \
+    -model "$model" \
+    -provider "$provider" \
+    -system "@$report_system" \
+    -prompt "@$report_prompt" \
+    -input "$findings" </dev/null >"$raw_report"; then
+    printf 'dorkeval: report request failed; findings are preserved in %s\n' \
+        "$findings" >&2
+    exit 1
+fi
+
+if [ ! -s "$raw_report" ]; then
+    printf 'dorkeval: report model returned empty output; findings are preserved in %s\n' \
+        "$findings" >&2
+    exit 1
+fi
+
+report_tmp=${report}.tmp.$$
+if ! cat "$raw_report" >"$report_tmp"; then
+    rm -f "$report_tmp"
+    printf 'dorkeval: cannot write report file: %s\n' "$report" >&2
+    exit 1
+fi
+if ! mv "$report_tmp" "$report"; then
+    rm -f "$report_tmp"
+    printf 'dorkeval: cannot install report file: %s\n' "$report" >&2
+    exit 1
+fi
+
+printf 'dorkeval: saved report to %s\n' "$report" >&2

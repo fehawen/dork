@@ -1,0 +1,8 @@
+Evaluate the following normalized search-result records.
+
+Input is JSONL. Each record has id, url, title, snippet, and queries (the
+search queries that returned the URL). Return findings as JSONL according to
+your system instructions. Use only supplied IDs in result_ids. Do not repeat
+the input records.
+
+Search results:

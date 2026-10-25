@@ -1,0 +1,13 @@
+Write a concise human-readable report from the following findings JSONL.
+
+For each finding, use its title, priority, confidence, assessment, reasoning,
+next_step, and evidence. Include relevant URLs and search context when useful.
+Keep the report focused on what an investigator should review next.
+
+Formatting requirements:
+- Keep lines at or below 80 characters where practical, including headings.
+- Wrap paragraphs at word boundaries.
+- Keep URLs intact, even if they exceed 80 characters.
+- Use consistent formatting for headings and lists.
+
+Findings:

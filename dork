@@ -1,0 +1,213 @@
+#!/bin/sh
+
+set -eu
+
+usage() {
+    printf 'Usage: %s <domain>\n' "${0##*/}" >&2
+    exit 1
+}
+
+[ "$#" -eq 1 ] || usage
+
+: "${SERPER_API_KEY:?Set SERPER_API_KEY in the environment}"
+
+domain=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | sed 's/\.$//')
+
+gl=${SERPER_GL:-se}
+hl=${SERPER_HL:-en}
+
+timestamp=$(date '+%Y%m%d%H%M')
+output_file="$domain.$timestamp.${0##*/}.jsonl"
+
+if [ -e "$output_file" ]; then
+    printf 'Error: output file already exists: %s\n' \
+        "$output_file" >&2
+    exit 1
+fi
+
+if ! : >"$output_file"; then
+    printf 'Error: cannot create output file: %s\n' \
+        "$output_file" >&2
+    exit 1
+fi
+
+printf 'JSONL output: %s\n' "$output_file" >&2
+
+tmpdir=$(mktemp -d)
+trap 'rm -rf "$tmpdir"' 0
+trap 'exit 1' HUP INT TERM
+
+request_file=$tmpdir/request.json
+response_file=$tmpdir/response.json
+
+failed=0
+count=0
+
+search() {
+    title=$1
+    query=$2
+    count=$((count + 1))
+
+    printf '\n=== %d. %s ===\n' "$count" "$title"
+    printf 'Query: %s\n\n' "$query"
+
+    if ! jq -n \
+        --arg q "$query" \
+        --arg gl "$gl" \
+        --arg hl "$hl" \
+        '{q: $q, gl: $gl, hl: $hl, num: 10}' \
+        >"$request_file"
+    then
+        printf 'Error: failed to create request\n' >&2
+        return 1
+    fi
+
+    if ! http_status=$(curl -sS \
+        --connect-timeout 10 \
+        --max-time 60 \
+        -o "$response_file" \
+        -w '%{http_code}' \
+        -X POST \
+        'https://google.serper.dev/search' \
+        -H "X-API-KEY: $SERPER_API_KEY" \
+        -H 'Content-Type: application/json' \
+        --data-binary "@$request_file")
+    then
+        printf 'Error: request failed for query: %s\n' \
+            "$query" >&2
+        return 1
+    fi
+
+    case $http_status in
+        2??) ;;
+        *)
+            printf 'Error: Serper returned HTTP %s for query: %s\n' \
+                "$http_status" "$query" >&2
+            jq -r '.message // .error // empty' \
+                "$response_file" >&2 || :
+            return 1
+            ;;
+    esac
+
+    if ! jq -e '(.organic | type) == "array"' \
+        "$response_file" >/dev/null
+    then
+        printf 'Error: unexpected Serper response for query: %s\n' \
+            "$query" >&2
+        return 1
+    fi
+
+    if ! jq -c --arg query "$query" '
+        .organic[] | {
+            query: $query,
+            title: (.title // ""),
+            url: (.link // ""),
+            snippet: (.snippet // "")
+        }
+    ' "$response_file" >>"$output_file"
+    then
+        printf 'Error: failed to write JSONL results for query: %s\n' \
+            "$query" >&2
+        return 1
+    fi
+
+    if ! jq -r '
+        if (.organic | length) == 0 then
+            "  No organic results."
+        else
+            .organic[] |
+            "  \(.title // "(untitled)")\n" +
+            "  \(.link // "")\n" +
+            "  \(.snippet // "No snippet available.")\n"
+        end
+    ' "$response_file"
+    then
+        printf 'Error: failed to display results for query: %s\n' \
+            "$query" >&2
+        return 1
+    fi
+}
+
+run_search() {
+    if ! search "$1" "$2"; then
+        failed=1
+    fi
+}
+
+run_search \
+    'Indexed pages' \
+    "site:$domain"
+
+run_search \
+    'Development and staging' \
+    "site:$domain (inurl:dev OR inurl:development OR inurl:staging)"
+
+run_search \
+    'Test and QA environments' \
+    "site:$domain (inurl:test OR inurl:qa OR inurl:uat)"
+
+run_search \
+    'Admin interfaces and dashboards' \
+    "site:$domain (inurl:admin OR inurl:dashboard OR inurl:manage)"
+
+run_search \
+    'Login and authentication' \
+    "site:$domain (inurl:login OR inurl:signin OR inurl:auth)"
+
+run_search \
+    'API documentation' \
+    "site:$domain (inurl:api-docs OR inurl:swagger OR inurl:openapi)"
+
+run_search \
+    'GraphQL endpoints and interfaces' \
+    "site:$domain (inurl:graphql OR inurl:graphiql)"
+
+run_search \
+    'Directory listings' \
+    "site:$domain (intitle:\"index of\" OR intitle:\"directory listing\")"
+
+run_search \
+    'Backups and older resources' \
+    "site:$domain (inurl:backup OR inurl:archive OR inurl:old)"
+
+run_search \
+    'Debugging and monitoring' \
+    "site:$domain (inurl:debug OR inurl:status OR inurl:metrics)"
+
+run_search \
+    'Robots and sitemaps' \
+    "site:$domain (inurl:robots.txt OR inurl:sitemap.xml)"
+
+run_search \
+    'PDF and document files' \
+    "site:$domain (filetype:pdf OR filetype:doc OR filetype:docx)"
+
+run_search \
+    'Spreadsheets and data files' \
+    "site:$domain (filetype:xls OR filetype:xlsx OR filetype:csv)"
+
+run_search \
+    'XML and JSON resources' \
+    "site:$domain (filetype:xml OR filetype:json)"
+
+run_search \
+    'GitHub references' \
+    "site:github.com \"$domain\""
+
+run_search \
+    'GitLab references' \
+    "site:gitlab.com \"$domain\""
+
+run_search \
+    'Portals and account interfaces' \
+    "site:$domain (inurl:console OR inurl:portal OR inurl:account)"
+
+run_search \
+    'Indexed AWS S3 resources' \
+    "site:s3.amazonaws.com \"$domain\""
+
+run_search \
+    'Cloud storage references on GitHub' \
+    "site:github.com \"$domain\" (\"s3.amazonaws.com\" OR \"storage.googleapis.com\" OR \"blob.core.windows.net\")"
+
+exit "$failed"
