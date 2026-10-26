@@ -132,6 +132,9 @@ run_search() {
     if ! search "$1" "$2"; then
         failed=1
     fi
+
+    # Be kind to the API.
+    sleep 1
 }
 
 run_search \
@@ -144,7 +147,7 @@ run_search \
 
 run_search \
     'Test and QA environments' \
-    "site:$domain (inurl:test OR inurl:qa OR inurl:uat)"
+    "site:$domain (inurl:test OR inurl:qa OR inurl:uat OR inurl:sansbox)"
 
 run_search \
     'Admin interfaces and dashboards' \
@@ -187,8 +190,8 @@ run_search \
     "site:$domain (filetype:xls OR filetype:xlsx OR filetype:csv)"
 
 run_search \
-    'XML and JSON resources' \
-    "site:$domain (filetype:xml OR filetype:json)"
+    'XML, YAML and JSON resources' \
+    "site:$domain (filetype:xml OR filetype:json OR filetype:jsonl OR filetype:yaml OR filetype:toml)"
 
 run_search \
     'GitHub references' \
@@ -209,5 +212,21 @@ run_search \
 run_search \
     'Cloud storage references on GitHub' \
     "site:github.com \"$domain\" (\"s3.amazonaws.com\" OR \"storage.googleapis.com\" OR \"blob.core.windows.net\")"
+
+run_search \
+    'Exposed password files' \
+    "site:$domain inurl:passwd"
+
+run_search \
+    'Exposed .htaccess and .htpasswd files' \
+    "site:$domain (inurl:.htaccess OR inurl:.htpasswd)"
+
+run_search \
+    'Exposed server configuration' \
+    "site:$domain (filetype:conf OR filetype:ini) (password OR secret OR credential)"
+
+run_search \
+    'Exposed backup files' \
+    "site:$domain (filetype:bak OR filetype:old OR filetype:orig) (config OR database OR passwd)"
 
 exit "$failed"
